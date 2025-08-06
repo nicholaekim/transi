@@ -56,35 +56,24 @@ class AdvancedModelManager:
     def _initialize_models(self) -> Dict[str, ModelConfig]:
         """Initialize available models with their configurations"""
         return {
-            # Fast, lightweight models for simple tasks
+            # Fast, lightweight model for simple text parsing tasks
             "llama3.1:8b": ModelConfig(
                 name="llama3.1:8b",
                 temperature=0.1,
                 top_p=0.9,
                 top_k=40,
-                max_tokens=200,
+                max_tokens=2048,
                 speed_score=9,
-                accuracy_score=7
-            ),
-            
-            # Balanced model for most tasks
-            "granite3.2-vision": ModelConfig(
-                name="granite3.2-vision",
-                temperature=0.3,
-                top_p=0.9,
-                top_k=40,
-                max_tokens=500,
-                speed_score=7,
                 accuracy_score=8
             ),
             
-            # High-accuracy model for complex tasks
+            # Powerful model for complex reasoning and long-form tasks
             "llama3.1:70b": ModelConfig(
                 name="llama3.1:70b",
-                temperature=0.5,
+                temperature=0.1,
                 top_p=0.9,
-                top_k=50,
-                max_tokens=1000,
+                top_k=40,
+                max_tokens=4096,
                 speed_score=4,
                 accuracy_score=10
             )
@@ -142,19 +131,19 @@ class AdvancedModelManager:
                            text_quality: float = 1.0, priority: str = "balanced") -> str:
         """Select optimal model based on task, document type, and requirements"""
         
-        # Task-specific model preferences
+        # Task-specific model preferences (text-specialist lineup)
         task_preferences = {
-            TaskType.DATE_EXTRACTION: ["llama3.1:8b", "granite3.2-vision"],
-            TaskType.TITLE_EXTRACTION: ["granite3.2-vision", "llama3.1:8b"],
-            TaskType.DESCRIPTION_EXTRACTION: ["llama3.1:70b", "granite3.2-vision"],
-            TaskType.VOLUME_ISSUE_EXTRACTION: ["llama3.1:8b", "granite3.2-vision"]
+            TaskType.DATE_EXTRACTION: ["llama3.1:70b"],  # Complex date pattern recognition
+            TaskType.TITLE_EXTRACTION: ["llama3.1:8b"],  # Fast, simple text parsing
+            TaskType.DESCRIPTION_EXTRACTION: ["llama3.1:70b"],  # Long-form, coherent summaries
+            TaskType.VOLUME_ISSUE_EXTRACTION: ["llama3.1:8b"]  # Fast numeric/text parsing
         }
         
         # Document type adjustments
         if doc_type == DocumentType.NEWSLETTER:
-            # Newsletters often have complex layouts, prefer vision model
+            # Newsletters often have complex layouts, prefer robust model
             if task in [TaskType.TITLE_EXTRACTION, TaskType.VOLUME_ISSUE_EXTRACTION]:
-                return "granite3.2-vision"
+                return "llama3.1:70b"
         
         elif doc_type == DocumentType.LETTER:
             # Letters are usually simpler, can use faster models
@@ -164,10 +153,10 @@ class AdvancedModelManager:
         # Text quality adjustments
         if text_quality < 0.7:  # Poor OCR quality
             # Use more robust models for poor quality text
-            return "granite3.2-vision"
+            return "llama3.1:70b"
         
         # Priority-based selection
-        preferred_models = task_preferences.get(task, ["granite3.2-vision"])
+        preferred_models = task_preferences.get(task, ["llama3.1:8b"])
         
         if priority == "speed":
             # Sort by speed score

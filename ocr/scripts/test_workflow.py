@@ -81,7 +81,7 @@ def check_ollama_status():
             models = response.json().get('models', [])
             model_names = [model['name'] for model in models]
             
-            required_models = ['granite3.2-vision', 'llama3.1:8b', 'llama3.1:70b']
+            required_models = ['llama3.1:8b', 'llama3.1:70b']
             missing_models = [m for m in required_models if not any(m in name for name in model_names)]
             
             if missing_models:

@@ -185,12 +185,12 @@ class EnhancedLLMExtractor:
         """Perform second-pass extraction with different model"""
         
         # Select different model for second pass
-        if first_result.model_used == "llama3.1:8b":
-            second_model = "granite3.2-vision"
-        elif first_result.model_used == "granite3.2-vision":
+        if first_result.model_used == "llama3.1:70b":
+            second_model = "llama3.1:8b"
+        elif first_result.model_used == "llama3.1:8b":
             second_model = "llama3.1:70b"
         else:
-            second_model = "granite3.2-vision"
+            second_model = "llama3.1:8b"
         
         logger.info(f"Performing second-pass extraction with {second_model}")
         
@@ -267,8 +267,8 @@ class EnhancedLLMExtractor:
         
         doc_type = self.model_manager.detect_document_type(text_segments)
         
-        # Use 2-3 different models
-        models = ["llama3.1:8b", "granite3.2-vision", "llama3.1:70b"]
+        # Use 2 different models
+        models = ["llama3.1:70b", "llama3.1:8b"]
         results = []
         
         for model in models[:2]:  # Use 2 models for consensus
