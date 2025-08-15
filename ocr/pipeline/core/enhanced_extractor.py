@@ -11,6 +11,10 @@ from typing import Dict, List, Optional, Tuple, Any
 import requests
 import json
 from pathlib import Path
+import re
+from hashlib import sha256
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .advanced_model_manager import (
     AdvancedModelManager, TaskType, DocumentType, ExtractionResult, ModelConfig
@@ -24,63 +28,18 @@ class EnhancedLLMExtractor:
     def __init__(self, ollama_url: str = "http://localhost:11434"):
         self.ollama_url = ollama_url
         self.model_manager = AdvancedModelManager()
-        self.training_examples = self._load_training_examples()
+        # HTTP session with retries
+        self._session = requests.Session()
+        retries = Retry(total=2, backoff_factor=0.1, status_forcelist=[429, 500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retries)
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
+        # In-memory cache only
+        self._cache: Dict[str, Any] = {}
         
-    def _load_training_examples(self) -> Dict[TaskType, List[Dict]]:
-        """Load training examples from collected data"""
-        examples = {
-            TaskType.DATE_EXTRACTION: [
-                {"text": "6 January 1986. Dear Friends,", "result": "1986-01-06"},
-                {"text": "November 15-17, 1985 meeting", "result": "1985-11-15"},
-                {"text": "Published in 1984", "result": "1984"}
-            ],
-            TaskType.TITLE_EXTRACTION: [
-                {"text": "Central American Task Force Newsletter", "result": "Central American Task Force Newsletter"},
-                {"text": "Dear Members, Re: Annual General Meeting", "result": "Annual General Meeting Notice"},
-                {"text": "Blessings of peace and courage for the new year!", "result": "New Year Blessings Message"}
-            ],
-            TaskType.DESCRIPTION_EXTRACTION: [
-                {"text": "The Annual General Meeting took place...", "result": "Summary of Annual General Meeting proceedings and decisions"},
-            ],
-            TaskType.VOLUME_ISSUE_EXTRACTION: [
-                {"text": "Volume 3, Issue 1", "result": "Volume 3, Issue 1"},
-                {"text": "Vol. 2 No. 4", "result": "Volume 2, Issue 4"},
-                {"text": "Newsletter #12", "result": "Issue 12"}
-            ]
-        }
-        
-        # Try to load from training data directory
-        training_dir = Path("training_data")
-        if training_dir.exists():
-            for file_path in training_dir.glob("*.json"):
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        # Extract examples from training data
-                        if 'corrections' in data:
-                            for field, value in data['corrections'].items():
-                                task = self._field_to_task(field)
-                                if task and 'original_results' in data:
-                                    examples[task].append({
-                                        "text": data.get('source_text', '')[:200],
-                                        "result": value
-                                    })
-                except Exception as e:
-                    logger.warning(f"Could not load training data from {file_path}: {e}")
-        
-        return examples
+
     
-    def _field_to_task(self, field: str) -> Optional[TaskType]:
-        """Convert field name to TaskType"""
-        mapping = {
-            'title': TaskType.TITLE_EXTRACTION,
-            'date': TaskType.DATE_EXTRACTION,
-            'description': TaskType.DESCRIPTION_EXTRACTION,
-            'volume_issue': TaskType.VOLUME_ISSUE_EXTRACTION
-        }
-        return mapping.get(field)
-    
-    def _make_ollama_request(self, model_name: str, prompt: str, config: ModelConfig) -> Tuple[str, float]:
+    def _make_ollama_request(self, model_name: str, prompt: str, config: ModelConfig, *, use_json: bool = False) -> Tuple[str, float]:
         """Make optimized request to Ollama with enhanced error handling"""
         start_time = time.time()
         
@@ -93,14 +52,16 @@ class EnhancedLLMExtractor:
                 "top_p": config.top_p,
                 "top_k": config.top_k,
                 "num_predict": config.max_tokens
-            }
+            },
+            # For short, structured fields, request strict JSON and early stop
+            **({"format": "json", "stop": ["\n\n", "\nExtraction:"]} if use_json else {})
         }
         
         try:
-            response = requests.post(
+            response = self._session.post(
                 f"{self.ollama_url}/api/generate",
                 json=payload,
-                timeout=120  # Increased timeout for larger models
+                timeout=(5, 30)  # connect, read timeouts tightened for speed
             )
             response.raise_for_status()
             
@@ -112,48 +73,108 @@ class EnhancedLLMExtractor:
         except requests.exceptions.RequestException as e:
             logger.error(f"Ollama request failed for {model_name}: {str(e)}")
             return "", time.time() - start_time
+
+    def detect_document_type(self, text_segments: List[str]) -> DocumentType:
+        """Fast document type detection"""
+        full_text = " ".join(text_segments).lower()
+        
+        # Simple keyword check
+        if any(w in full_text for w in ['volume', 'issue', 'newsletter']):
+            return DocumentType.NEWSLETTER
+        elif any(w in full_text for w in ['dear', 'sincerely', 'yours']):
+            return DocumentType.LETTER
+        elif any(w in full_text for w in ['report', 'analysis', 'findings']):
+            return DocumentType.REPORT
+        else:
+            return DocumentType.UNKNOWN
+
+    def _cache_key(self, task: TaskType, text_segments: List[str]) -> str:
+        joined = "\n".join(text_segments)
+        h = sha256(joined.encode('utf-8')).hexdigest()
+        return f"{task.value}:{h}"
+
+    def _cache_get(self, key: str) -> Optional[ExtractionResult]:
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+        return ExtractionResult(entry.get('value', ''), entry.get('confidence', 0.0), entry.get('model_used', 'cache'), entry.get('processing_time', 0.0))
+
+    def _cache_set(self, key: str, result: ExtractionResult) -> None:
+        # In-memory cache only for speed
+        self._cache[key] = {
+            'value': result.value,
+            'confidence': result.confidence,
+            'model_used': result.model_used,
+            'processing_time': result.processing_time,
+        }
+
+
+
+    def _pre_extract(self, task: TaskType, text_segments: List[str]) -> Optional[ExtractionResult]:
+        """Cheap regex/heuristic pre-extraction to avoid LLM calls when possible"""
+        text = "\n".join(text_segments)
+
+        # Date/year extraction
+        if task == TaskType.DATE_EXTRACTION:
+            # Prefer ISO-like full dates
+            m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+            if m:
+                value = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                conf = 0.9
+                self.model_manager.record_performance("regex", task, 0.0, conf)
+                return ExtractionResult(value, conf, "regex", 0.0)
+            # Fallback to a standalone year
+            m = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+            if m:
+                value = m.group(1)
+                conf = 0.8
+                self.model_manager.record_performance("regex", task, 0.0, conf)
+                return ExtractionResult(value, conf, "regex", 0.0)
+
+        # Volume/Issue extraction
+        if task == TaskType.VOLUME_ISSUE_EXTRACTION:
+            # Patterns like: Volume 3, Issue 1  |  Vol. 2 No. 4
+            m = re.search(r"\b(?:Volume|Vol\.)\s*(\d+)\s*[, ]\s*(?:Issue|No\.)\s*(\d+)\b", text, re.IGNORECASE)
+            if m:
+                value = f"Volume {m.group(1)}, Issue {m.group(2)}"
+                conf = 0.85
+                self.model_manager.record_performance("regex", task, 0.0, conf)
+                return ExtractionResult(value, conf, "regex", 0.0)
+            # Simpler issue-only patterns like: Issue #12
+            m = re.search(r"\b(?:Issue|No\.)\s*#?(\d+)\b", text, re.IGNORECASE)
+            if m:
+                value = f"Issue {m.group(1)}"
+                conf = 0.7
+                self.model_manager.record_performance("regex", task, 0.0, conf)
+                return ExtractionResult(value, conf, "regex", 0.0)
+
+        # Title extraction from explicit Subject:
+        if task == TaskType.TITLE_EXTRACTION:
+            for line in text.splitlines():
+                subj = re.match(r"^\s*Subject\s*:\s*(.+)$", line, re.IGNORECASE)
+                if subj:
+                    value = subj.group(1).strip()
+                    if value:
+                        conf = 0.75
+                        self.model_manager.record_performance("regex", task, 0.0, conf)
+                        return ExtractionResult(value, conf, "regex", 0.0)
+
+        return None
     
     def _estimate_confidence(self, result: str, task: TaskType, text_segments: List[str]) -> float:
-        """Estimate confidence in extraction result"""
+        """Fast confidence estimation"""
         if not result or result.lower() in ['no', 'none', 'not found', 'n/a']:
             return 0.1
         
-        confidence = 0.5  # Base confidence
-        
-        # Task-specific confidence adjustments
+        # Simple length-based confidence (fast)
         if task == TaskType.DATE_EXTRACTION:
-            # Check for valid date patterns
-            import re
-            if re.match(r'\d{4}-\d{2}-\d{2}', result):
-                confidence += 0.4
-            elif re.match(r'\d{4}', result):
-                confidence += 0.3
-            
+            return 0.9 if re.match(r'\d{4}(-\d{2}-\d{2})?', result) else 0.6
         elif task == TaskType.TITLE_EXTRACTION:
-            # Check title characteristics
-            if 10 <= len(result) <= 100:
-                confidence += 0.3
-            if result[0].isupper():
-                confidence += 0.1
-            
-        elif task == TaskType.DESCRIPTION_EXTRACTION:
-            # Check description quality
-            if 50 <= len(result) <= 500:
-                confidence += 0.3
-            if result.count('.') >= 2:
-                confidence += 0.1
-            
+            return 0.8 if 5 <= len(result) <= 120 else 0.6
         elif task == TaskType.VOLUME_ISSUE_EXTRACTION:
-            # Check for volume/issue patterns
-            if any(word in result.lower() for word in ['volume', 'vol', 'issue', 'no']):
-                confidence += 0.4
-        
-        # Check if result appears in source text
-        full_text = " ".join(text_segments).lower()
-        if result.lower() in full_text:
-            confidence += 0.1
-        
-        return min(1.0, confidence)
+            return 0.9 if any(w in result.lower() for w in ['vol', 'issue', 'no']) else 0.6
+        else:  # DESCRIPTION
+            return 0.8 if 20 <= len(result) <= 600 else 0.6
     
     def _extract_with_model(self, task: TaskType, text_segments: List[str], 
                            model_name: str, doc_type: DocumentType) -> ExtractionResult:
@@ -162,51 +183,40 @@ class EnhancedLLMExtractor:
         # Get optimized configuration
         config = self.model_manager.get_model_config(model_name, task)
         
-        # Create enhanced prompt with examples
-        examples = self.training_examples.get(task, [])
-        prompt = self.model_manager.create_enhanced_prompt(task, doc_type, text_segments, examples)
+        # Create minimal prompt (skip examples for speed)
+        prompt = self.model_manager.create_enhanced_prompt(task, doc_type, text_segments, [])
         
-        # Add text segments to prompt
-        prompt += f"\n\nText to analyze:\n{' '.join(text_segments)}\n\nExtraction:"
+        # Simple truncation (skip ranking for speed)
+        joined = " ".join(text_segments)
+        truncated = joined[:1000]  # Smaller for speed
+        prompt += f"\n\nText to analyze:\n{truncated}\n\nExtraction:"
         
-        # Make request
-        result, processing_time = self._make_ollama_request(model_name, prompt, config)
+        # Decide if we want JSON output for compact fields
+        use_json = task in (TaskType.TITLE_EXTRACTION, TaskType.DATE_EXTRACTION, TaskType.VOLUME_ISSUE_EXTRACTION)
+        result_text, processing_time = self._make_ollama_request(model_name, prompt, config, use_json=use_json)
+
+        # Parse JSON if requested
+        parsed_value = None
+        if use_json and result_text:
+            try:
+                parsed = json.loads(result_text)
+                if isinstance(parsed, dict) and 'value' in parsed:
+                    parsed_value = str(parsed.get('value', '')).strip()
+            except Exception:
+                parsed_value = None
+        final_text = (parsed_value if parsed_value is not None else result_text)
         
         # Estimate confidence
-        confidence = self._estimate_confidence(result, task, text_segments)
+        confidence = self._estimate_confidence(final_text, task, text_segments)
         
-        # Record performance
-        self.model_manager.record_performance(model_name, task, processing_time, confidence)
+        # Skip performance recording for speed
         
-        return ExtractionResult(result, confidence, model_name, processing_time)
+        return ExtractionResult(final_text, confidence, model_name, processing_time)
     
-    def _two_pass_extraction(self, task: TaskType, text_segments: List[str], 
-                           doc_type: DocumentType, first_result: ExtractionResult) -> ExtractionResult:
-        """Perform second-pass extraction with different model"""
-        
-        # Select different model for second pass
-        if first_result.model_used == "llama3.1:70b":
-            second_model = "llama3.1:8b"
-        elif first_result.model_used == "llama3.1:8b":
-            second_model = "llama3.1:70b"
-        else:
-            second_model = "llama3.1:8b"
-        
-        logger.info(f"Performing second-pass extraction with {second_model}")
-        
-        # Extract with second model
-        second_result = self._extract_with_model(task, text_segments, second_model, doc_type)
-        
-        # Choose best result based on confidence
-        if second_result.confidence > first_result.confidence:
-            logger.info(f"Second-pass improved confidence: {first_result.confidence:.2f} -> {second_result.confidence:.2f}")
-            return second_result
-        else:
-            logger.info(f"First-pass result retained (confidence: {first_result.confidence:.2f})")
-            return first_result
+
     
     def extract_single(self, task: TaskType, text_segments: List[str], 
-                      priority: str = "balanced") -> ExtractionResult:
+                       priority: str = "balanced") -> ExtractionResult:
         """Extract single field with intelligent model selection"""
         
         # Detect document type
@@ -214,6 +224,20 @@ class EnhancedLLMExtractor:
         
         # Estimate text quality
         text_quality = self.model_manager.estimate_text_quality(text_segments)
+        
+        # Cache lookup
+        ck = self._cache_key(task, text_segments)
+        cached = self._cache_get(ck)
+        if cached:
+            logger.info(f"Cache hit for {task.value}")
+            return cached
+
+        # Cheap pre-extraction to avoid LLM calls when possible
+        pre = self._pre_extract(task, text_segments)
+        if pre and pre.confidence >= 0.75:
+            logger.info(f"Pre-extractor satisfied {task.value} with confidence {pre.confidence:.2f}")
+            self._cache_set(ck, pre)
+            return pre
         
         # Select optimal model
         model_name = self.model_manager.select_optimal_model(task, doc_type, text_quality, priority)
@@ -223,97 +247,30 @@ class EnhancedLLMExtractor:
         # First pass extraction
         result = self._extract_with_model(task, text_segments, model_name, doc_type)
         
-        # Check if second pass is needed
-        if self.model_manager.should_use_two_pass(task, result.confidence, doc_type):
-            result = self._two_pass_extraction(task, text_segments, doc_type, result)
+        # No two-pass needed with dedicated models
+        
+        # Save in cache
+        self._cache_set(ck, result)
         
         return result
     
     def extract_parallel(self, text_segments: List[str], priority: str = "balanced") -> Dict[str, ExtractionResult]:
-        """Extract all fields in parallel for maximum speed"""
-        
-        tasks = [
-            TaskType.TITLE_EXTRACTION,
-            TaskType.DATE_EXTRACTION,
-            TaskType.DESCRIPTION_EXTRACTION,
-            TaskType.VOLUME_ISSUE_EXTRACTION
-        ]
+        """Extract all fields in parallel"""
+        tasks = [TaskType.TITLE_EXTRACTION, TaskType.DATE_EXTRACTION, 
+                TaskType.DESCRIPTION_EXTRACTION, TaskType.VOLUME_ISSUE_EXTRACTION]
         
         results = {}
-        
-        # Use ThreadPoolExecutor for parallel processing
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            # Submit all tasks
-            future_to_task = {
-                executor.submit(self.extract_single, task, text_segments, priority): task
-                for task in tasks
-            }
-            
-            # Collect results
+            future_to_task = {executor.submit(self.extract_single, task, text_segments): task for task in tasks}
             for future in concurrent.futures.as_completed(future_to_task):
                 task = future_to_task[future]
                 try:
-                    result = future.result()
-                    results[task.value] = result
-                    logger.info(f"Completed {task.value}: confidence={result.confidence:.2f}, time={result.processing_time:.2f}s")
+                    results[task.value] = future.result()
                 except Exception as e:
-                    logger.error(f"Task {task.value} failed: {str(e)}")
+                    logger.error(f"Task {task.value} failed: {e}")
                     results[task.value] = ExtractionResult("", 0.0, "error", 0.0)
-        
         return results
     
-    def extract_with_consensus(self, task: TaskType, text_segments: List[str]) -> ExtractionResult:
-        """Extract using multiple models and consensus"""
-        
-        doc_type = self.model_manager.detect_document_type(text_segments)
-        
-        # Use 2 different models
-        models = ["llama3.1:70b", "llama3.1:8b"]
-        results = []
-        
-        for model in models[:2]:  # Use 2 models for consensus
-            try:
-                result = self._extract_with_model(task, text_segments, model, doc_type)
-                results.append(result)
-            except Exception as e:
-                logger.error(f"Consensus extraction failed for {model}: {e}")
-        
-        if not results:
-            return ExtractionResult("", 0.0, "consensus_failed", 0.0)
-        
-        # Simple consensus: choose highest confidence
-        best_result = max(results, key=lambda r: r.confidence)
-        
-        # If results are very different but confidences are similar, prefer more conservative result
-        if len(results) > 1:
-            confidence_diff = abs(results[0].confidence - results[1].confidence)
-            if confidence_diff < 0.2 and results[0].value != results[1].value:
-                # Choose shorter, more conservative result for titles
-                if task == TaskType.TITLE_EXTRACTION:
-                    best_result = min(results, key=lambda r: len(r.value))
-        
-        # Mark as consensus result
-        best_result.model_used = f"consensus({best_result.model_used})"
-        
-        return best_result
+
     
-    # Legacy interface methods for backward compatibility
-    def extract_title(self, text_segments: List[str]) -> str:
-        """Extract title (legacy interface)"""
-        result = self.extract_single(TaskType.TITLE_EXTRACTION, text_segments)
-        return result.value
-    
-    def extract_date(self, text_segments: List[str]) -> str:
-        """Extract date (legacy interface)"""
-        result = self.extract_single(TaskType.DATE_EXTRACTION, text_segments)
-        return result.value
-    
-    def extract_description(self, text_segments: List[str]) -> str:
-        """Extract description (legacy interface)"""
-        result = self.extract_single(TaskType.DESCRIPTION_EXTRACTION, text_segments)
-        return result.value
-    
-    def extract_volume_issue(self, text_segments: List[str]) -> str:
-        """Extract volume/issue (legacy interface)"""
-        result = self.extract_single(TaskType.VOLUME_ISSUE_EXTRACTION, text_segments)
-        return result.value
+
